@@ -40,7 +40,6 @@ def get_live_matches():
         r = requests.get(f"{API_BASE}/football-current-live",
                          headers=HEADERS, timeout=15)
         data = r.json()
-        # Структура: {"status": "success", "response": {"live": [...]}}
         matches = data.get("response", {}).get("live", [])
         print(f"  Матчей в эфире: {len(matches)}")
         return matches
@@ -55,48 +54,44 @@ def get_match_events(match_id):
                          headers=HEADERS,
                          params={"matchId": match_id},
                          timeout=15)
-        if r.status_code != 200:
-            return []
         data = r.json()
-        # Пробуем разные ключи
-        events = (data.get("response", {}).get("events") or
-                  data.get("response", []) or
-                  data.get("events", []) or [])
-        if isinstance(events, dict):
-            events = list(events.values())
-        return events if isinstance(events, list) else []
+        print(f"  Events для {match_id}: {str(data)[:300]}")
+        response = data.get("response", {})
+        if isinstance(response, list):
+            return response
+        if isinstance(response, dict):
+            for key in ["events", "incidents", "data"]:
+                if key in response and isinstance(response[key], list):
+                    return response[key]
+        return []
     except Exception as e:
         print(f"[API] Ошибка событий {match_id}: {e}")
         return []
 
 
 def check_goal_burst(events, team_id, team_name):
-    """Проверяем 2 гола за 20 минут в первом тайме"""
     goal_minutes = []
     for e in events:
-        # Тип события
         etype = str(e.get("type", "")).lower()
         if "goal" not in etype:
             continue
-
-        # Пропускаем автоголы и незабитые
         detail = str(e.get("detail", e.get("subtype", ""))).lower()
-        if "own" in detail or "miss" in detail or "penalty" in detail:
+        if "own" in detail or "miss" in detail:
             continue
 
-        # Проверяем команду по id или имени
-        e_team_id = e.get("teamId") or e.get("team_id")
-        e_team_name = str(e.get("teamName", e.get("team", {}).get("name", "") if isinstance(e.get("team"), dict) else e.get("team", ""))).lower()
+        e_team_id = str(e.get("teamId", e.get("team_id", "")))
+        team_obj = e.get("team", {})
+        e_team_name = team_obj.get("name", "") if isinstance(team_obj, dict) else str(team_obj)
 
-        team_match = (str(e_team_id) == str(team_id)) or (team_name.lower() in e_team_name) or (e_team_name in team_name.lower())
+        team_match = (e_team_id == str(team_id)) or \
+                     (team_name.lower() in e_team_name.lower()) or \
+                     (e_team_name.lower() in team_name.lower())
         if not team_match:
             continue
 
-        # Минута
         minute = int(e.get("minute", e.get("time", 0)) or 0)
         if FIRST_HALF_ONLY and minute > 45:
             continue
-
         goal_minutes.append(minute)
 
     goal_minutes.sort()
@@ -109,11 +104,6 @@ def check_goal_burst(events, team_id, team_name):
 
 
 def process_match(match):
-    # Структура матча из /football-current-live:
-    # {'id': 5238256, 'leagueId': 923718, 'time': '20:30',
-    #  'home': {'id': ..., 'name': '...', 'score': 0},
-    #  'away': {'id': ..., 'name': '...', 'score': 0}}
-
     match_id = match.get("id")
     if not match_id:
         return
@@ -127,13 +117,11 @@ def process_match(match):
     home_score = home.get("score", 0) or 0
     away_score = away.get("score", 0) or 0
 
-    # Минута матча
-    minute = int(match.get("minute", match.get("elapsed", match.get("status", {}).get("elapsed", 0))) or 0)
-    if isinstance(minute, str):
-        try:
-            minute = int(minute.replace("'", "").strip())
-        except:
-            minute = 0
+    minute = match.get("minute") or match.get("elapsed") or 0
+    try:
+        minute = int(str(minute).replace("'", "").strip())
+    except:
+        minute = 0
 
     if FIRST_HALF_ONLY and minute > 45:
         return
@@ -141,13 +129,10 @@ def process_match(match):
     events = get_match_events(match_id)
     time.sleep(0.5)
 
-    league_id = match.get("leagueId", "")
-
     for team_name, team_id in [(home_name, home_id), (away_name, away_id)]:
         key = f"{match_id}_{team_id}"
         if key in notified:
             continue
-
         triggered, trigger_minute = check_goal_burst(events, team_id, team_name)
         if triggered:
             notified[key] = True
@@ -165,22 +150,25 @@ def process_match(match):
 
 def main():
     print("=" * 50)
-    print("🤖 Бот запущен! v4")
+    print("🤖 Бот запущен! v5")
     print(f"📋 {GOALS_THRESHOLD} гола за {MINUTES_WINDOW} мин в 1-м тайме")
     print("=" * 50)
 
-    send_telegram("✅ <b>Бот v4 запущен!</b>\nСлежу за всеми лигами 👀")
+    send_telegram("✅ <b>Бот v5 запущен!</b>\nСлежу за всеми лигами 👀")
 
     while True:
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Проверяю матчи...")
-        matches = get_live_matches()
-        for match in matches:
-            try:
-                process_match(match)
-            except Exception as e:
-                print(f"  Ошибка: {e}")
-        if len(notified) > 1000:
-            notified.clear()
+        try:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Проверяю матчи...")
+            matches = get_live_matches()
+            for match in matches:
+                try:
+                    process_match(match)
+                except Exception as e:
+                    print(f"  Ошибка матча: {e}")
+            if len(notified) > 1000:
+                notified.clear()
+        except Exception as e:
+            print(f"[ГЛАВНАЯ ОШИБКА] {e}")
         time.sleep(CHECK_INTERVAL)
 
 
