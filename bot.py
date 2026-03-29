@@ -3,18 +3,14 @@ import time
 from datetime import datetime
 
 # ============================================================
-#  НАСТРОЙКИ
-# ============================================================
 TELEGRAM_TOKEN = "8031024083:AAE8gFsy6RhRHIXa6gcRk96bSk3cG8Ifhjg"
 TELEGRAM_CHAT_ID = "168902166"
 FOOTBALL_API_KEY = "de56d8553amsh4f25358ccb4626ep15bca0jsn22d4391773a3"
 
-# Алгоритм
-GOALS_THRESHOLD = 2    # голов
-MINUTES_WINDOW = 20    # за сколько минут
-FIRST_HALF_ONLY = True # только первый тайм
-
-CHECK_INTERVAL = 60    # проверка каждые 60 секунд
+GOALS_THRESHOLD = 2
+MINUTES_WINDOW = 20
+FIRST_HALF_ONLY = True
+CHECK_INTERVAL = 60
 # ============================================================
 
 API_BASE = "https://free-api-live-football-data.p.rapidapi.com"
@@ -40,83 +36,214 @@ def send_telegram(message):
 
 
 def get_live_matches():
-    try:
-        r = requests.get(f"{API_BASE}/football-get-all-live-matches",
-                         headers=HEADERS, timeout=15)
-        data = r.json()
-        matches = data.get("response", data.get("matches", data.get("data", [])))
-        if isinstance(matches, dict):
-            matches = matches.get("match", [])
-        return matches if isinstance(matches, list) else []
-    except Exception as e:
-        print(f"[API] Ошибка live матчей: {e}")
-        return []
+    """Пробуем разные endpoints для live матчей"""
+    endpoints = [
+        ("/football-get-all-live-matches", {}),
+        ("/football-get-matches-by-date", {"date": datetime.now().strftime("%Y-%m-%d")}),
+        ("/football-get-livescores", {}),
+        ("/livescores", {}),
+    ]
+
+    for path, params in endpoints:
+        try:
+            r = requests.get(f"{API_BASE}{path}",
+                             headers=HEADERS,
+                             params=params,
+                             timeout=15)
+            print(f"  Endpoint {path}: status={r.status_code}")
+            if r.status_code != 200:
+                continue
+
+            data = r.json()
+            print(f"  Ключи ответа: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+
+            # Ищем список матчей в любом месте ответа
+            matches = find_matches(data)
+            if matches:
+                print(f"  Найдено матчей: {len(matches)} через {path}")
+                return matches
+        except Exception as e:
+            print(f"  Ошибка {path}: {e}")
+
+    return []
 
 
-def get_match_events(fixture_id):
-    try:
-        r = requests.get(f"{API_BASE}/football-get-match-events",
-                         headers=HEADERS,
-                         params={"matchId": fixture_id},
-                         timeout=15)
-        data = r.json()
-        events = data.get("response", data.get("events", data.get("data", [])))
-        if isinstance(events, dict):
-            events = events.get("event", [])
-        return events if isinstance(events, list) else []
-    except Exception as e:
-        print(f"[API] Ошибка событий {fixture_id}: {e}")
-        return []
+def find_matches(data):
+    """Рекурсивно ищем список матчей в ответе API"""
+    if isinstance(data, list) and len(data) > 0:
+        if isinstance(data[0], dict):
+            return data
+
+    if isinstance(data, dict):
+        # Прямые ключи где могут быть матчи
+        for key in ["response", "matches", "data", "match", "fixtures",
+                    "livescores", "events", "results", "games"]:
+            if key in data:
+                val = data[key]
+                if isinstance(val, list) and len(val) > 0:
+                    return val
+                if isinstance(val, dict):
+                    result = find_matches(val)
+                    if result:
+                        return result
+
+    return []
+
+
+def get_match_events(match_id):
+    """Получить события матча"""
+    endpoints = [
+        f"/football-get-match-events",
+        f"/football-get-events",
+    ]
+    params_variants = [
+        {"matchId": match_id},
+        {"fixtureId": match_id},
+        {"id": match_id},
+    ]
+
+    for path in endpoints:
+        for params in params_variants:
+            try:
+                r = requests.get(f"{API_BASE}{path}",
+                                 headers=HEADERS,
+                                 params=params,
+                                 timeout=15)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                events = find_events(data)
+                if events:
+                    return events
+            except:
+                pass
+    return []
+
+
+def find_events(data):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ["response", "events", "data", "event", "incidents"]:
+            if key in data:
+                val = data[key]
+                if isinstance(val, list):
+                    return val
+    return []
 
 
 def extract_match_info(match):
-    fixture_id = (match.get("id") or match.get("matchId") or
-                  match.get("fixture", {}).get("id") or str(match))
-    home = (match.get("homeTeam", {}).get("name") or
-            match.get("home_team") or
-            match.get("teams", {}).get("home", {}).get("name") or "Хозяева")
-    away = (match.get("awayTeam", {}).get("name") or
-            match.get("away_team") or
-            match.get("teams", {}).get("away", {}).get("name") or "Гости")
-    league = (match.get("league", {}).get("name") or
-              match.get("competition", {}).get("name") or
-              match.get("leagueName") or "Лига")
-    country = (match.get("league", {}).get("country") or
-               match.get("competition", {}).get("country") or "")
-    home_score = (match.get("homeScore") or match.get("score", {}).get("home") or
-                  match.get("goals", {}).get("home") or 0)
-    away_score = (match.get("awayScore") or match.get("score", {}).get("away") or
-                  match.get("goals", {}).get("away") or 0)
-    minute = (match.get("minute") or match.get("elapsed") or
-              match.get("fixture", {}).get("status", {}).get("elapsed") or 0)
-    return fixture_id, home, away, league, country, home_score, away_score, minute
+    """Извлечь инфо о матче из любой структуры"""
+    def get_val(obj, *keys):
+        for k in keys:
+            if isinstance(obj, dict) and k in obj:
+                v = obj[k]
+                if v is not None:
+                    return v
+        return None
 
+    fixture_id = get_val(match, "id", "matchId", "fixtureId", "fixture_id")
+    if isinstance(fixture_id, dict):
+        fixture_id = fixture_id.get("id")
 
-def extract_event_info(event):
-    event_type = (event.get("type") or event.get("eventType") or "").lower()
-    team = (event.get("team", {}).get("name") or
-            event.get("teamName") or
-            event.get("team") or "")
-    minute = (event.get("time", {}).get("elapsed") or
-              event.get("minute") or
-              event.get("elapsed") or 0)
-    detail = (event.get("detail") or event.get("eventDetail") or "")
-    return event_type, team, minute, detail
+    # Команды
+    home_obj = get_val(match, "homeTeam", "home_team", "home")
+    away_obj = get_val(match, "awayTeam", "away_team", "away")
+    teams = match.get("teams", {})
+
+    if isinstance(home_obj, dict):
+        home = home_obj.get("name", "Хозяева")
+    elif isinstance(home_obj, str):
+        home = home_obj
+    elif teams:
+        home = teams.get("home", {}).get("name", "Хозяева")
+    else:
+        home = "Хозяева"
+
+    if isinstance(away_obj, dict):
+        away = away_obj.get("name", "Гости")
+    elif isinstance(away_obj, str):
+        away = away_obj
+    elif teams:
+        away = teams.get("away", {}).get("name", "Гости")
+    else:
+        away = "Гости"
+
+    # Лига
+    league_obj = get_val(match, "league", "competition", "tournament")
+    if isinstance(league_obj, dict):
+        league = league_obj.get("name", "Лига")
+        country = league_obj.get("country", "")
+    else:
+        league = str(league_obj) if league_obj else get_val(match, "leagueName", "competitionName") or "Лига"
+        country = ""
+
+    # Счёт
+    score_obj = get_val(match, "score", "goals", "result")
+    if isinstance(score_obj, dict):
+        home_score = score_obj.get("home", score_obj.get("homeTeam", 0)) or 0
+        away_score = score_obj.get("away", score_obj.get("awayTeam", 0)) or 0
+    else:
+        home_score = get_val(match, "homeScore", "home_score") or 0
+        away_score = get_val(match, "awayScore", "away_score") or 0
+
+    # Минута
+    status_obj = get_val(match, "status", "fixture")
+    if isinstance(status_obj, dict):
+        minute = status_obj.get("elapsed", status_obj.get("minute", 0)) or 0
+    else:
+        minute = get_val(match, "minute", "elapsed", "time") or 0
+    if isinstance(minute, dict):
+        minute = minute.get("elapsed", 0) or 0
+
+    return fixture_id, home, away, league, country, home_score, away_score, int(minute or 0)
 
 
 def check_goal_burst(events, team_name):
     goal_minutes = []
     for event in events:
-        event_type, team, minute, detail = extract_event_info(event)
+        # Тип события
+        event_type = ""
+        for k in ["type", "eventType", "incident_type", "kind"]:
+            if k in event:
+                event_type = str(event[k]).lower()
+                break
+
         if "goal" not in event_type:
             continue
-        if "missed" in detail.lower() or "own" in detail.lower():
+
+        # Детали (пропускаем пенальти и автоголы)
+        detail = ""
+        for k in ["detail", "eventDetail", "description"]:
+            if k in event:
+                detail = str(event[k]).lower()
+                break
+        if "missed" in detail or "own" in detail:
             continue
-        if team_name.lower() not in team.lower() and team.lower() not in team_name.lower():
+
+        # Команда
+        team = ""
+        team_obj = event.get("team", event.get("teamName", event.get("team_name", "")))
+        if isinstance(team_obj, dict):
+            team = team_obj.get("name", "")
+        else:
+            team = str(team_obj)
+
+        if not team or (team_name.lower() not in team.lower() and team.lower() not in team_name.lower()):
             continue
-        if FIRST_HALF_ONLY and int(minute or 0) > 45:
+
+        # Минута
+        minute = 0
+        time_obj = event.get("time", event.get("minute", event.get("elapsed", 0)))
+        if isinstance(time_obj, dict):
+            minute = time_obj.get("elapsed", 0) or 0
+        else:
+            minute = int(time_obj or 0)
+
+        if FIRST_HALF_ONLY and minute > 45:
             continue
-        goal_minutes.append(int(minute or 0))
+
+        goal_minutes.append(minute)
 
     goal_minutes.sort()
     for i in range(len(goal_minutes)):
@@ -129,15 +256,22 @@ def check_goal_burst(events, team_name):
 
 def process_match(match):
     fixture_id, home, away, league, country, home_score, away_score, minute = extract_match_info(match)
-    if FIRST_HALF_ONLY and int(minute or 0) > 45:
+
+    if not fixture_id:
         return
+    if FIRST_HALF_ONLY and minute > 45:
+        return
+
     events = get_match_events(fixture_id)
     time.sleep(0.5)
+
     for team_name in [home, away]:
         key = f"{fixture_id}_{team_name}"
         if key in notified:
             continue
+
         triggered, trigger_minute = check_goal_burst(events, team_name)
+
         if triggered:
             notified[key] = True
             message = (
@@ -157,11 +291,10 @@ def main():
     print("=" * 50)
     print("🤖 Бот запущен!")
     print(f"📋 Алгоритм: {GOALS_THRESHOLD} гола за {MINUTES_WINDOW} мин в 1-м тайме")
-    print(f"⏱ Проверка каждые {CHECK_INTERVAL} секунд")
     print("=" * 50)
 
     send_telegram(
-        "✅ <b>Бот запущен!</b>\n\n"
+        "✅ <b>Бот перезапущен (v2)!</b>\n\n"
         f"Алгоритм: {GOALS_THRESHOLD} гола за {MINUTES_WINDOW} мин в первом тайме\n"
         "Слежу за всеми лигами 👀"
     )
@@ -169,14 +302,17 @@ def main():
     while True:
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Проверяю матчи...")
         matches = get_live_matches()
-        print(f"  Матчей в эфире: {len(matches)}")
+        print(f"  Итого матчей: {len(matches)}")
+
         for match in matches:
             try:
                 process_match(match)
             except Exception as e:
                 print(f"  Ошибка: {e}")
+
         if len(notified) > 1000:
             notified.clear()
+
         time.sleep(CHECK_INTERVAL)
 
 
