@@ -48,53 +48,80 @@ def get_live_matches():
         return []
 
 
-def get_match_events(match_id):
+def get_match_detail(match_id):
     try:
-        r = requests.get(f"{API_BASE}/football-get-match-events",
+        r = requests.get(f"{API_BASE}/football-get-match-detail",
                          headers=HEADERS,
-                         params={"matchId": match_id},
+                         params={"eventid": match_id},
                          timeout=15)
         data = r.json()
-        print(f"  Events для {match_id}: {str(data)[:300]}")
-        response = data.get("response", {})
-        if isinstance(response, list):
-            return response
-        if isinstance(response, dict):
-            for key in ["events", "incidents", "data"]:
-                if key in response and isinstance(response[key], list):
-                    return response[key]
-        return []
+        print(f"  Detail для {match_id}: {str(data)[:400]}")
+        return data.get("response", {})
     except Exception as e:
-        print(f"[API] Ошибка событий {match_id}: {e}")
-        return []
+        print(f"[API] Ошибка detail {match_id}: {e}")
+        return {}
 
 
-def check_goal_burst(events, team_id, team_name):
+def find_goals_in_detail(detail, team_id, team_name):
+    """
+    Ищем голы в любом месте структуры detail.
+    Возвращаем список минут голов команды.
+    """
     goal_minutes = []
-    for e in events:
-        etype = str(e.get("type", "")).lower()
-        if "goal" not in etype:
-            continue
-        detail = str(e.get("detail", e.get("subtype", ""))).lower()
-        if "own" in detail or "miss" in detail:
-            continue
 
-        e_team_id = str(e.get("teamId", e.get("team_id", "")))
-        team_obj = e.get("team", {})
-        e_team_name = team_obj.get("name", "") if isinstance(team_obj, dict) else str(team_obj)
+    def search(obj, depth=0):
+        if depth > 6:
+            return
+        if isinstance(obj, list):
+            for item in obj:
+                search(item, depth + 1)
+        elif isinstance(obj, dict):
+            # Проверяем — это событие гола?
+            obj_str = str(obj).lower()
+            is_goal = ("goal" in obj_str and
+                       "missed" not in obj_str and
+                       "owngoal" not in obj_str.replace("own goal", "X"))
 
-        team_match = (e_team_id == str(team_id)) or \
-                     (team_name.lower() in e_team_name.lower()) or \
-                     (e_team_name.lower() in team_name.lower())
-        if not team_match:
-            continue
+            if is_goal:
+                # Ищем минуту
+                minute = None
+                for k in ["minute", "time", "elapsed", "min"]:
+                    if k in obj and obj[k] is not None:
+                        try:
+                            minute = int(str(obj[k]).replace("'", "").strip())
+                            break
+                        except:
+                            pass
 
-        minute = int(e.get("minute", e.get("time", 0)) or 0)
-        if FIRST_HALF_ONLY and minute > 45:
-            continue
-        goal_minutes.append(minute)
+                # Ищем команду
+                team_match = False
+                for k in ["teamId", "team_id", "teamID"]:
+                    if k in obj and str(obj[k]) == str(team_id):
+                        team_match = True
+                        break
+                if not team_match:
+                    for k in ["teamName", "team_name", "team"]:
+                        if k in obj:
+                            val = obj[k]
+                            name = val.get("name", "") if isinstance(val, dict) else str(val)
+                            if team_name.lower() in name.lower() or name.lower() in team_name.lower():
+                                team_match = True
+                                break
 
-    goal_minutes.sort()
+                if team_match and minute is not None:
+                    if not (FIRST_HALF_ONLY and minute > 45):
+                        goal_minutes.append(minute)
+                        return  # не углубляемся дальше в этот объект
+
+            for v in obj.values():
+                search(v, depth + 1)
+
+    search(detail)
+    return goal_minutes
+
+
+def check_goal_burst(goal_minutes):
+    goal_minutes = sorted(goal_minutes)
     for i in range(len(goal_minutes)):
         for j in range(i + 1, len(goal_minutes)):
             if goal_minutes[j] - goal_minutes[i] <= MINUTES_WINDOW:
@@ -126,14 +153,25 @@ def process_match(match):
     if FIRST_HALF_ONLY and minute > 45:
         return
 
-    events = get_match_events(match_id)
+    # Пропускаем если у обеих команд уже есть уведомление
+    key_home = f"{match_id}_{home_id}"
+    key_away = f"{match_id}_{away_id}"
+    if key_home in notified and key_away in notified:
+        return
+
+    detail = get_match_detail(match_id)
     time.sleep(0.5)
 
-    for team_name, team_id in [(home_name, home_id), (away_name, away_id)]:
-        key = f"{match_id}_{team_id}"
+    for team_name, team_id, key in [
+        (home_name, home_id, key_home),
+        (away_name, away_id, key_away)
+    ]:
         if key in notified:
             continue
-        triggered, trigger_minute = check_goal_burst(events, team_id, team_name)
+
+        goal_minutes = find_goals_in_detail(detail, team_id, team_name)
+        triggered, trigger_minute = check_goal_burst(goal_minutes)
+
         if triggered:
             notified[key] = True
             message = (
@@ -150,11 +188,11 @@ def process_match(match):
 
 def main():
     print("=" * 50)
-    print("🤖 Бот запущен! v5")
+    print("🤖 Бот запущен! v6")
     print(f"📋 {GOALS_THRESHOLD} гола за {MINUTES_WINDOW} мин в 1-м тайме")
     print("=" * 50)
 
-    send_telegram("✅ <b>Бот v5 запущен!</b>\nСлежу за всеми лигами 👀")
+    send_telegram("✅ <b>Бот v6 запущен!</b>\nСлежу за всеми лигами 👀")
 
     while True:
         try:
